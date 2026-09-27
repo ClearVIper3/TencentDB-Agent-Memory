@@ -11,6 +11,7 @@ import { MetadataService } from "./metadata-service.js";
 import { SqliteMetadataStore } from "../store/sqlite-adapter.js";
 import type { V3AuthContext } from "../router/auth.js";
 import type { AgentEntity, UserEntity } from "../types.js";
+import { buildChatMemoryAssetId } from "../utils/chat-memory-asset.js";
 
 let store: SqliteMetadataStore;
 let svc: MetadataService;
@@ -22,12 +23,13 @@ beforeEach(() => {
   svc = new MetadataService(store);
 });
 
-async function makeUser(): Promise<UserEntity> {
+async function makeUser(over: { user_type?: string } = {}): Promise<UserEntity> {
   seq += 1;
   return store.createUser({
     auth_provider: "local",
     external_id: `ext-${seq}`,
     username: `user${seq}`,
+    ...over,
   });
 }
 
@@ -101,6 +103,16 @@ describe("deleteAgentsForCaller 权限矩阵", () => {
     ).rejects.toMatchObject({ code: "agent_not_found" });
   });
 
+  it("ctx 缺少 userId 时抛 permission_denied（防未鉴权上下文穿透）", async () => {
+    const owner = await makeUser();
+    const { agent } = await seedTeamWithAgent(owner);
+
+    await expect(
+      svc.deleteAgentsForCaller([agent.agent_id], { token: "k", userId: undefined, isAdmin: false, isSystemAdmin: false }),
+    ).rejects.toMatchObject({ code: "permission_denied" });
+    expect(await store.getAgentById(agent.agent_id)).not.toBeNull();
+  });
+
   it("system_admin 归档不存在的 agent 同样显式 404", async () => {
     const sysadmin = await makeUser();
 
@@ -111,13 +123,26 @@ describe("deleteAgentsForCaller 权限矩阵", () => {
 });
 
 describe("archiveAgentForCaller 权限矩阵", () => {
-  it("team admin 可以代归档成员的 agent", async () => {
+  it("team admin 可以代归档成员的 agent，chat_memory 资产随之清理", async () => {
     const admin = await makeUser();
     const member = await makeUser();
-    const { agent } = await seedTeamWithAgent(admin, member);
+    const { team, agent } = await seedTeamWithAgent(admin, member);
+    // archive 内核会顺手删除 agent 自身的 chat_memory 资产
+    const chatMemoryId = buildChatMemoryAssetId(team.team_id, agent.agent_id);
+    await store.createAsset({
+      asset_id: chatMemoryId,
+      team_id: team.team_id,
+      asset_type: "chat_memory",
+      name: "Memory",
+      owner_user_id: member.user_id,
+      source_type: "auto",
+      visibility: "private",
+      status: "active",
+    });
 
     const archived = await svc.archiveAgentForCaller(agent.agent_id, ctxFor(admin));
     expect(archived.status).toBe("inactive");
+    expect(await store.getAssetById(chatMemoryId)).toBeNull();
   });
 
   it("system_admin 无需成员身份即可归档", async () => {
@@ -180,6 +205,20 @@ describe("removeTeamMemberForCaller 级联", () => {
     ).rejects.toMatchObject({ code: "permission_denied" });
     expect(await store.getAgentById(agent.agent_id)).not.toBeNull();
   });
+
+  it("普通成员调用移除成员被拒，agent 不被误删", async () => {
+    const owner = await makeUser();
+    const member = await makeUser();
+    const peer = await makeUser();
+    const { team, agent } = await seedTeamWithAgent(owner, member);
+    await store.addTeamMember({ team_id: team.team_id, user_id: peer.user_id, role: "member" });
+
+    await expect(
+      svc.removeTeamMemberForCaller(team.team_id, member.user_id, ctxFor(peer)),
+    ).rejects.toMatchObject({ code: "permission_denied" });
+    expect(await store.getAgentById(agent.agent_id)).not.toBeNull();
+    expect(await store.getTeamMember(team.team_id, member.user_id)).not.toBeNull();
+  });
 });
 
 describe("deleteUsersForCaller 级联", () => {
@@ -214,5 +253,17 @@ describe("deleteUsersForCaller 级联", () => {
     await expect(
       svc.deleteUsersForCaller([victim.user_id], ctxFor(teamOwner)),
     ).rejects.toMatchObject({ code: "permission_denied" });
+  });
+
+  it("不能删除最后一个 system_admin", async () => {
+    const sysadmin = await makeUser({ user_type: "system_admin" });
+    const member = await makeUser();
+    const { agent } = await seedTeamWithAgent(member);
+
+    await expect(
+      svc.deleteUsersForCaller([sysadmin.user_id], ctxFor(sysadmin, { isSystemAdmin: true })),
+    ).rejects.toMatchObject({ code: "last_system_admin" });
+    expect(await store.getAgentById(agent.agent_id)).not.toBeNull();
+    expect(await store.getUserById(sysadmin.user_id)).not.toBeNull();
   });
 });
