@@ -10,17 +10,18 @@
  * 本路由的做法（业务级联收口在 control 层，不改内核）：
  *   1. auth/verify 反查 caller
  *   2. agent/get 拿到 agent，校验 caller 是 owner / team admin / system admin
- *   3a. Owner 路径：skill/list 按 owner_agent_id + active 分页拉全 → 逐条 skill/delete
- *       → 全部成功后调 meta/agent/archive（内核顺手清 chat_memory）
- *   3b. Admin 路径：跳过 skill 逐条删除（skill/delete 要求 owner），
- *       改调 meta/agent/delete 硬删除（内核已放行 admin，完整级联由 deleteAgents 处理）
+ *   3. skill/list 按 owner_agent_id + active 分页拉全 → 逐条 skill/delete
+ *      （owner 与 admin 都走这一步：skill/delete 只校验 (team_id, agent_id) 与
+ *       skill 归属匹配、不校验 caller 身份 —— 见 core/skill/skill-permission.ts
+ *       assertOwner，历史上的"要求 caller 是 owner"注释是误读）
+ *   4a. Owner：meta/agent/archive（软删除，与原有行为一致；内核顺手清 chat_memory）
+ *   4b. Admin（team admin / system admin）：meta/agent/delete 硬删除 ——
+ *       owner 不可达/已删除时归档只会留下新孤儿；内核 deleteAgents 完整级联
+ *       task_agents / fixed_assets / chat_memory，已放行 admin
+ *       （与 createAgentForCaller 允许 admin 代建对称）
  *
- * Admin 代删说明：
- *   - Owner 路径走 archive（软删除，与原有行为一致）
- *   - Admin（team admin / system admin）路径走硬删除（owner 不可恢复时归档无意义，
- *     且 skill/delete 要求 caller 是 owner，admin 无法逐条清理 skill）
- *   - 内核 deleteAgentsForCaller 已扩展为 owner-or-team-admin，与 createAgentForCaller
- *     允许 admin 代建对称
+ * 任一 skill 删除失败立即中断，agent 不会被 archive/delete，返回 500 +
+ * 已删列表 + 失败 skill_id，caller 修复后重试。
  */
 import type { Hono } from 'hono';
 import type { PanelDeps } from '../../panel-deps.js';
@@ -88,6 +89,56 @@ async function listAgentSkills(
   return { ok: true, items: all };
 }
 
+/**
+ * skill 级联清理：分页拉全 agent 名下 active skill 并逐条删除。
+ * owner 与 admin 路径共用 —— skill/delete 的校验对象是 (team_id, agent_id) 与
+ * skill 归属的匹配关系，不涉及 caller 身份，admin 代删同样清得干净。
+ * 任一删除失败立即中断（返回失败 envelope），agent 保持原状，调用方可重试。
+ */
+async function deleteAgentSkillsCascade(
+  deps: PanelDeps,
+  ctx: MetaCallContext,
+  callerId: string,
+  agent: AgentRaw,
+  requestId: string,
+): Promise<{ ok: true; deletedIds: string[] } | { ok: false; envelope: MetaEnvelope<unknown> }> {
+  const listRes = await listAgentSkills(deps, ctx, callerId, agent.team_id, agent.agent_id);
+  if (!listRes.ok) return { ok: false, envelope: listRes.envelope };
+
+  const deletedIds: string[] = [];
+  for (const s of listRes.items) {
+    const delEnv = await deps.skillKernel.invoke(
+      'delete',
+      {
+        user_id: callerId,
+        team_id: agent.team_id,
+        agent_id: agent.agent_id,
+        skill_id: s.skill_id,
+        expected_version: s.version,
+      },
+      ctx,
+    );
+    if (delEnv.code !== 0) {
+      return {
+        ok: false,
+        envelope: {
+          code: 500,
+          message: 'SKILL_DELETE_FAILED',
+          request_id: requestId,
+          data: {
+            failed_skill_id: s.skill_id,
+            kernel_code: delEnv.code,
+            kernel_message: delEnv.message,
+            deleted_skill_ids: deletedIds,
+          },
+        },
+      };
+    }
+    deletedIds.push(s.skill_id);
+  }
+  return { ok: true, deletedIds };
+}
+
 export function registerAgentLifecycleRoutes(api: Hono, deps: PanelDeps): void {
   const mw = validatePanelMetaHeaders(deps);
 
@@ -115,44 +166,13 @@ export function registerAgentLifecycleRoutes(api: Hono, deps: PanelDeps): void {
     if (!canDelete) canDelete = await isTeamAdmin(deps, ctx, agent.team_id, callerId);
     if (!canDelete) return respondControlError(c, 403, 'NOT_YOUR_AGENT');
 
-    // ── Owner 路径：skill 逐条删除 → agent/archive（软删除，保留原有行为） ──
+    // 3. skill 逐条清理（owner / admin 共用）
+    const skillRes = await deleteAgentSkillsCascade(deps, ctx, callerId, agent, c.get('reqId') ?? '');
+    if (!skillRes.ok) return respondEnvelope(c, skillRes.envelope);
+    const { deletedIds } = skillRes;
+
+    // ── Owner：agent/archive（软删除，保留原有行为）──
     if (isOwner) {
-      // 3. skill list
-      const listRes = await listAgentSkills(deps, ctx, callerId, agent.team_id, agent.agent_id);
-      if (!listRes.ok) return respondEnvelope(c, listRes.envelope);
-      const skills = listRes.items;
-
-      // 4. 逐条 skill/delete —— 任一失败立即中断，agent 不 archive
-      const deletedIds: string[] = [];
-      for (const s of skills) {
-        const delEnv = await deps.skillKernel.invoke(
-          'delete',
-          {
-            user_id: callerId,
-            team_id: agent.team_id,
-            agent_id: agent.agent_id,
-            skill_id: s.skill_id,
-            expected_version: s.version,
-          },
-          ctx,
-        );
-        if (delEnv.code !== 0) {
-          return respondEnvelope(c, {
-            code: 500,
-            message: 'SKILL_DELETE_FAILED',
-            request_id: c.get('reqId') ?? '',
-            data: {
-              failed_skill_id: s.skill_id,
-              kernel_code: delEnv.code,
-              kernel_message: delEnv.message,
-              deleted_skill_ids: deletedIds,
-            },
-          });
-        }
-        deletedIds.push(s.skill_id);
-      }
-
-      // 5. agent/archive —— 内核仍然会顺手清 chat_memory
       const archiveEnv = await deps.metaKernel.invoke('agent/archive', { agent_id: agentId }, ctx);
       if (archiveEnv.code !== 0) return respondEnvelope(c, archiveEnv);
 
@@ -167,19 +187,21 @@ export function registerAgentLifecycleRoutes(api: Hono, deps: PanelDeps): void {
       );
     }
 
-    // ── Admin 路径：跳过 skill 逐条删除，走 agent/delete 硬删除 ──
-    // skill/delete 要求 caller 是 owner，admin 无法代删；agent/delete 内核已放行 admin，
-    // 完整级联（task_agents, fixed_assets, chat_memory）由 store 层 deleteAgents 处理
+    // ── Admin：agent/delete 硬删除 ──
+    // owner 已不可达（成员被移除/用户被删）或 admin 明确要删，archive 只会留下新孤儿；
+    // 完整级联（task_agents, fixed_assets, chat_memory）由内核 deleteAgents 处理。
     const deleteEnv = await deps.metaKernel.invoke('agent/delete', { agent_ids: [agentId] }, ctx);
     if (deleteEnv.code !== 0) return respondEnvelope(c, deleteEnv);
 
+    // 硬删除不用 archived:true 表述（那是软删语义），用 deleted:true + admin_initiated 区分
     return respondEnvelope(
       c,
       okEnvelope(c, {
-        archived: true,
+        deleted: true,
+        archived: false,
         agent_id: agentId,
-        deleted_skill_count: 0,
-        deleted_skill_ids: [],
+        deleted_skill_count: deletedIds.length,
+        deleted_skill_ids: deletedIds,
         admin_initiated: true,
       }),
     );
